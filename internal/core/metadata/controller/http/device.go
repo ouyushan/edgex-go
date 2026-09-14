@@ -223,6 +223,33 @@ func (dc *DeviceController) PatchDevice(c echo.Context) error {
 	return pkg.EncodeAndWriteResponse(updateResponses, w, lc)
 }
 
+func (dc *DeviceController) PatchDeviceProperties(c echo.Context) error {
+	r := c.Request()
+	w := c.Response()
+	if r.Body != nil {
+		defer func() { _ = r.Body.Close() }()
+	}
+
+	lc := container.LoggingClientFrom(dc.dic.Get)
+	ctx := r.Context()
+
+	// URL parameters
+	name := c.Param(common.Name)
+
+	var reqDTO requestDTO.DevicePropertiesRequest
+	if err := dc.reader.Read(r.Body, &reqDTO); err != nil {
+		return utils.WriteErrorResponse(w, ctx, lc, err, "")
+	}
+
+	if err := application.PatchDeviceProperties(name, reqDTO.UpdateDeviceProperties, ctx, dc.dic); err != nil {
+		return utils.WriteErrorResponse(w, ctx, lc, err, reqDTO.RequestId)
+	}
+
+	response := commonDTO.NewBaseResponse(reqDTO.RequestId, "", http.StatusOK)
+	utils.WriteHttpHeader(w, ctx, http.StatusOK)
+	return pkg.EncodeAndWriteResponse(response, w, lc)
+}
+
 func (dc *DeviceController) AllDevices(c echo.Context) error {
 	lc := container.LoggingClientFrom(dc.dic.Get)
 	r := c.Request()
@@ -246,6 +273,12 @@ func (dc *DeviceController) AllDevices(c echo.Context) error {
 	devices, totalCount, err := application.AllDevices(offset, limit, labels, parent, levels, dc.dic)
 	if err != nil {
 		return utils.WriteErrorResponse(w, ctx, lc, err, "")
+	}
+
+	if utils.ParseQueryStringToString(r, common.BasicInfoOnly, common.ValueFalse) == common.ValueTrue {
+		for i := range devices {
+			devices[i].Properties = nil
+		}
 	}
 
 	response := responseDTO.NewMultiDevicesResponse("", "", http.StatusOK, totalCount, devices)

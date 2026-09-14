@@ -73,6 +73,7 @@ func LoadRestRoutes(r *echo.Echo, dic *di.Container, serviceName string) {
 	r.GET(common.ApiDeviceByServiceNameRoute, d.DevicesByServiceName, authenticationHook)
 	r.GET(common.ApiDeviceNameExistsRoute, d.DeviceNameExists, authenticationHook)
 	r.PATCH(common.ApiDeviceRoute, d.PatchDevice, authenticationHook)
+	r.PATCH(common.ApiDevicePropertiesByNameRoute, d.PatchDeviceProperties, authenticationHook)
 	r.GET(common.ApiAllDeviceRoute, d.AllDevices, authenticationHook)
 	r.GET(common.ApiDeviceByNameRoute, d.DeviceByName, authenticationHook)
 	r.GET(common.ApiDeviceRoute+"/"+common.Id+"/:"+common.Id, d.DeviceById, authenticationHook)

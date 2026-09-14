@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/edgexfoundry/edgex-go/internal/core/metadata/utils"
 	"github.com/stretchr/testify/mock"
 	"gopkg.in/yaml.v3"
 
@@ -145,6 +146,9 @@ func mockDic() *di.Container {
 		},
 		bootstrapContainer.LoggingClientInterfaceName: func(get di.Get) interface{} {
 			return logger.NewMockClient()
+		},
+		container.ProfileAssignmentLockName: func(get di.Get) interface{} {
+			return utils.NewProfileAssignmentLock()
 		},
 	})
 }

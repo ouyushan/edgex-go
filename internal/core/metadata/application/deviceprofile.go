@@ -148,6 +148,13 @@ func DeleteDeviceProfileByName(name string, ctx context.Context, dic *di.Contain
 	if name == "" {
 		return errors.NewCommonEdgeX(errors.KindContractInvalid, "name is empty", nil)
 	}
+
+	// Wait for the in-flight device writes, so that the association check below doesn't miss a
+	// device which is being written but not in the database yet
+	profileAssignmentLock := container.ProfileAssignmentLockFrom(dic.Get)
+	profileAssignmentLock.Lock()
+	defer profileAssignmentLock.Unlock()
+
 	dbClient := container.DBClientFrom(dic.Get)
 	profile, err := dbClient.DeviceProfileByName(name)
 	if err != nil {

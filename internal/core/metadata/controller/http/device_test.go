@@ -1063,3 +1063,208 @@ func TestDevicesByProfileName(t *testing.T) {
 		})
 	}
 }
+
+func TestPatchDeviceProperties(t *testing.T) {
+	device := dtos.ToDeviceModel(buildTestDeviceRequest().Device)
+	// ToDeviceModel assigns Properties by reference and the patch merges in place, so without a
+	// private copy the valid cases would rewrite the package-level testProperties fixture
+	device.Properties = map[string]any{"TestProperty1": "property1", "TestProperty2": true}
+	notFoundName := "notFoundName"
+	updateProperties := map[string]any{"TestProperty1": "newProperty1", "TestProperty4": "property4"}
+	testReq := requests.DevicePropertiesRequest{
+		BaseRequest: commonDTO.BaseRequest{
+			Versionable: commonDTO.NewVersionable(),
+			RequestId:   ExampleUUID,
+		},
+		UpdateDeviceProperties: dtos.UpdateDeviceProperties{Properties: updateProperties},
+	}
+
+	valid := testReq
+	noRequestId := valid
+	noRequestId.RequestId = ""
+	noProperties := testReq
+	noProperties.Properties = nil
+	emptyProperties := testReq
+	emptyProperties.Properties = map[string]any{}
+
+	dic := mockDic()
+	dbClientMock := &dbMock.DBClient{}
+	dbClientMock.On("DeviceByName", device.Name).Return(device, nil)
+	dbClientMock.On("DeviceByName", notFoundName).Return(device, edgexErr.NewCommonEdgeX(edgexErr.KindEntityDoesNotExist, "not found", nil))
+	dbClientMock.On("UpdateDevice", mock.Anything).Return(nil)
+	dic.Update(di.ServiceConstructorMap{
+		container.DBClientInterfaceName: func(get di.Get) interface{} {
+			return dbClientMock
+		},
+	})
+
+	controller := NewDeviceController(dic)
+	require.NotNil(t, controller)
+
+	tests := []struct {
+		name               string
+		deviceName         string
+		request            requests.DevicePropertiesRequest
+		expectedStatusCode int
+	}{
+		{"valid", device.Name, valid, http.StatusOK},
+		{"valid - no request id", device.Name, noRequestId, http.StatusOK},
+		{"invalid - device not found", notFoundName, valid, http.StatusNotFound},
+		{"invalid - empty device name", "", valid, http.StatusBadRequest},
+		{"invalid - no properties", device.Name, noProperties, http.StatusBadRequest},
+		{"invalid - empty properties", device.Name, emptyProperties, http.StatusBadRequest},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			e := echo.New()
+			jsonData, err := json.Marshal(testCase.request)
+			require.NoError(t, err)
+
+			reader := strings.NewReader(string(jsonData))
+			req, err := http.NewRequest(http.MethodPatch, common.ApiDevicePropertiesByNameRoute, reader)
+			require.NoError(t, err)
+
+			// Act
+			recorder := httptest.NewRecorder()
+			c := e.NewContext(req, recorder)
+			c.SetParamNames(common.Name)
+			c.SetParamValues(testCase.deviceName)
+			err = controller.PatchDeviceProperties(c)
+			require.NoError(t, err)
+
+			var res commonDTO.BaseResponse
+			err = json.Unmarshal(recorder.Body.Bytes(), &res)
+			require.NoError(t, err)
+
+			assert.Equal(t, common.ApiVersion, res.ApiVersion, "API Version not as expected")
+			assert.Equal(t, testCase.expectedStatusCode, recorder.Result().StatusCode, "HTTP status code not as expected")
+			if res.RequestId != "" {
+				assert.Equal(t, ExampleUUID, res.RequestId, "RequestID not as expected")
+			}
+		})
+	}
+}
+
+func TestPatchDeviceProperties_MergeAndDelete(t *testing.T) {
+	const deletedKey = "TestProperty1"
+	const keptKey = "TestProperty2"
+	const newKey = "TestProperty4"
+	const newValue = "property4"
+
+	device := dtos.ToDeviceModel(buildTestDeviceRequest().Device)
+	// the fixture map is package-level, so give this device its own copy to mutate
+	device.Properties = map[string]any{deletedKey: "property1", keptKey: true}
+
+	dic := mockDic()
+	dbClientMock := &dbMock.DBClient{}
+	dbClientMock.On("DeviceByName", device.Name).Return(device, nil)
+	var updated models.Device
+	dbClientMock.On("UpdateDevice", mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+		updated = args.Get(0).(models.Device)
+	})
+	dic.Update(di.ServiceConstructorMap{
+		container.DBClientInterfaceName: func(get di.Get) interface{} {
+			return dbClientMock
+		},
+	})
+
+	controller := NewDeviceController(dic)
+	require.NotNil(t, controller)
+
+	testReq := requests.DevicePropertiesRequest{
+		BaseRequest: commonDTO.BaseRequest{
+			Versionable: commonDTO.NewVersionable(),
+			RequestId:   ExampleUUID,
+		},
+		UpdateDeviceProperties: dtos.UpdateDeviceProperties{
+			Properties: map[string]any{newKey: newValue, deletedKey: nil},
+		},
+	}
+	jsonData, err := json.Marshal(testReq)
+	require.NoError(t, err)
+
+	e := echo.New()
+	req, err := http.NewRequest(http.MethodPatch, common.ApiDevicePropertiesByNameRoute, strings.NewReader(string(jsonData)))
+	require.NoError(t, err)
+	recorder := httptest.NewRecorder()
+	c := e.NewContext(req, recorder)
+	c.SetParamNames(common.Name)
+	c.SetParamValues(device.Name)
+	require.NoError(t, controller.PatchDeviceProperties(c))
+	require.Equal(t, http.StatusOK, recorder.Result().StatusCode)
+
+	assert.NotContains(t, updated.Properties, deletedKey, "property with a null value was not deleted")
+	assert.Equal(t, true, updated.Properties[keptKey], "property absent from the patch must be preserved")
+	assert.Equal(t, newValue, updated.Properties[newKey], "new property was not added")
+}
+
+func TestAllDevices_BasicInfoOnly(t *testing.T) {
+	// each device needs its own Properties map, and the expectation must not alias them, so that
+	// the assertion still has an unpolluted reference if the handler ever mutates what it trims
+	expectedProperties := map[string]any{"TestProperty1": "property1", "TestProperty2": true}
+	newDevice := func() models.Device {
+		d := dtos.ToDeviceModel(buildTestDeviceRequest().Device)
+		d.Properties = map[string]any{"TestProperty1": "property1", "TestProperty2": true}
+		return d
+	}
+	devices := []models.Device{newDevice(), newDevice()}
+	totalCount := int64(len(devices))
+
+	dic := mockDic()
+	dbClientMock := &dbMock.DBClient{}
+	dbClientMock.On("DeviceCountByLabels", []string(nil)).Return(totalCount, nil)
+	dbClientMock.On("AllDevices", 0, 10, []string(nil)).Return(devices, nil)
+	dic.Update(di.ServiceConstructorMap{
+		container.DBClientInterfaceName: func(get di.Get) interface{} {
+			return dbClientMock
+		},
+	})
+	controller := NewDeviceController(dic)
+	require.NotNil(t, controller)
+
+	tests := []struct {
+		name             string
+		basicInfoOnly    string
+		expectProperties bool
+	}{
+		{"basicInfoOnly true drops the properties", common.ValueTrue, false},
+		{"basicInfoOnly false keeps the properties", common.ValueFalse, true},
+		{"absent basicInfoOnly keeps the properties", "", true},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			e := echo.New()
+			req, err := http.NewRequest(http.MethodGet, common.ApiAllDeviceRoute, http.NoBody)
+			require.NoError(t, err)
+			query := req.URL.Query()
+			query.Add(common.Offset, "0")
+			query.Add(common.Limit, "10")
+			if testCase.basicInfoOnly != "" {
+				query.Add(common.BasicInfoOnly, testCase.basicInfoOnly)
+			}
+			req.URL.RawQuery = query.Encode()
+
+			recorder := httptest.NewRecorder()
+			c := e.NewContext(req, recorder)
+			require.NoError(t, controller.AllDevices(c))
+			require.Equal(t, http.StatusOK, recorder.Result().StatusCode)
+
+			var res responseDTO.MultiDevicesResponse
+			require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &res))
+			require.Len(t, res.Devices, len(devices))
+
+			for _, d := range res.Devices {
+				if testCase.expectProperties {
+					assert.Equal(t, expectedProperties, d.Properties, "properties must be untouched")
+				} else {
+					assert.Nil(t, d.Properties, "properties must be dropped")
+				}
+				// the trimming must not disturb any other field
+				assert.Equal(t, TestDeviceName, d.Name)
+				assert.Equal(t, TestDeviceServiceName, d.ServiceName)
+				assert.Equal(t, testDeviceLabels, d.Labels)
+				assert.NotEmpty(t, d.Protocols, "protocols must be untouched")
+			}
+		})
+	}
+}
