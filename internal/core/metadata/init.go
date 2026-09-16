@@ -48,9 +48,13 @@ func (b *Bootstrap) BootstrapHandler(ctx context.Context, wg *sync.WaitGroup, _ 
 	LoadRestRoutes(b.router, dic, b.serviceName)
 
 	capacityCheckLock := utils.NewCapacityCheckLock()
+	profileAssignmentLock := utils.NewProfileAssignmentLock()
 	dic.Update(di.ServiceConstructorMap{
 		container.CapacityCheckLockName: func(get di.Get) interface{} {
 			return capacityCheckLock
+		},
+		container.ProfileAssignmentLockName: func(get di.Get) interface{} {
+			return profileAssignmentLock
 		},
 	})
 	return true

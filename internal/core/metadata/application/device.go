@@ -47,6 +47,12 @@ func AddDevice(d models.Device, ctx context.Context, dic *di.Container, bypassVa
 	lc := bootstrapContainer.LoggingClientFrom(dic.Get)
 	config := container.ConfigurationFrom(dic.Get)
 
+	// Block the deletion of the device profile until the device is written, the deletion check
+	// cannot see the reference from the device which is not in the database yet
+	profileAssignmentLock := container.ProfileAssignmentLockFrom(dic.Get)
+	profileAssignmentLock.RLock()
+	defer profileAssignmentLock.RUnlock()
+
 	// Check the existence of device service before device validation
 	exists, edgeXerr := dbClient.DeviceServiceNameExists(d.ServiceName)
 	if edgeXerr != nil {
@@ -222,6 +228,12 @@ func DeviceNameExists(name string, dic *di.Container) (exists bool, err errors.E
 func PatchDevice(dto dtos.UpdateDevice, ctx context.Context, dic *di.Container, bypassValidation bool) errors.EdgeX {
 	dbClient := container.DBClientFrom(dic.Get)
 
+	// Block the deletion of the device profile until the device is updated, the deletion check
+	// cannot see the reference from the device which is not updated in the database yet
+	profileAssignmentLock := container.ProfileAssignmentLockFrom(dic.Get)
+	profileAssignmentLock.RLock()
+	defer profileAssignmentLock.RUnlock()
+
 	// Check the existence of device service before device validation
 	if dto.ServiceName != nil {
 		exists, edgeXerr := dbClient.DeviceServiceNameExists(*dto.ServiceName)
@@ -275,6 +287,39 @@ func PatchDevice(dto dtos.UpdateDevice, ctx context.Context, dic *di.Container, 
 	}
 
 	return updateDeviceInDB(device, oldServiceName, ctx, dic)
+}
+
+// PatchDeviceProperties merges the properties patch into the existing device.
+// A property whose value is null is deleted (see requests.ReplaceDeviceModelPropertiesWithDTO).
+// Properties affect neither the profile reference nor the resource count, so the profile,
+// capacity and auto-event validations that PatchDevice performs are skipped here.
+func PatchDeviceProperties(deviceName string, dto dtos.UpdateDeviceProperties, ctx context.Context, dic *di.Container) errors.EdgeX {
+	if deviceName == "" {
+		return errors.NewCommonEdgeX(errors.KindContractInvalid, "name is empty", nil)
+	}
+	if len(dto.Properties) == 0 {
+		return errors.NewCommonEdgeX(errors.KindContractInvalid, "properties is empty", nil)
+	}
+	dbClient := container.DBClientFrom(dic.Get)
+	lc := bootstrapContainer.LoggingClientFrom(dic.Get)
+
+	device, err := dbClient.DeviceByName(deviceName)
+	if err != nil {
+		return errors.NewCommonEdgeXWrapper(err)
+	}
+
+	requests.ReplaceDeviceModelPropertiesWithDTO(&device, dto)
+
+	if err = dbClient.UpdateDevice(device); err != nil {
+		return errors.NewCommonEdgeXWrapper(err)
+	}
+
+	lc.Debugf("Device properties patched on DB successfully. Correlation-ID: %s ", correlation.FromContext(ctx))
+
+	deviceDTO := dtos.FromDeviceModelToDTO(device)
+	go publishSystemEvent(common.DeviceSystemEventType, common.SystemEventActionUpdate, device.ServiceName, deviceDTO, ctx, dic)
+
+	return nil
 }
 
 // updateDeviceInDB calls the UpdateDevice method from the infrastructure layer and validate the device auto events

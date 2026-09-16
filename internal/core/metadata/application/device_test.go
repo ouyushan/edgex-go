@@ -7,12 +7,18 @@ package application
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/edgexfoundry/edgex-go/internal/core/metadata/config"
 	"github.com/edgexfoundry/edgex-go/internal/core/metadata/container"
 	"github.com/edgexfoundry/edgex-go/internal/core/metadata/infrastructure/interfaces/mocks"
+	"github.com/edgexfoundry/edgex-go/internal/core/metadata/utils"
 	"github.com/edgexfoundry/edgex-go/internal/pkg/correlation"
+	"github.com/edgexfoundry/go-mod-core-contracts/v4/dtos"
+	"github.com/stretchr/testify/mock"
 
 	bootstrapContainer "github.com/edgexfoundry/go-mod-bootstrap/v4/bootstrap/container"
 	"github.com/edgexfoundry/go-mod-bootstrap/v4/di"
@@ -36,6 +42,7 @@ var (
 		DeviceResources: []models.DeviceResource{{Name: source1}, {Name: source2}},
 		DeviceCommands:  []models.DeviceCommand{{Name: command1}, {Name: command2}},
 	}
+	testDeviceServiceName = "TestDeviceServiceName"
 )
 
 func TestValidateParentProfileAndAutoEvents(t *testing.T) {
@@ -278,6 +285,229 @@ func TestForceAddDevice(t *testing.T) {
 				require.Equal(t, returnedDevice.Id, result)
 			}
 		})
+	}
+}
+
+func newDeviceWriteDBClientMock(deviceName string) *mocks.DBClient {
+	dbClientMock := &mocks.DBClient{}
+	dbClientMock.On("DeviceProfileByName", profile).Return(deviceProfile, nil)
+	dbClientMock.On("DeviceServiceNameExists", testDeviceServiceName).Return(true, nil)
+	dbClientMock.On("DeviceNameExists", deviceName).Return(false, nil)
+	dbClientMock.On("DeviceByName", deviceName).Return(models.Device{
+		Name: deviceName, ServiceName: testDeviceServiceName, ProfileName: profile,
+	}, nil)
+	// No device or provision watcher is associated with the profile, so the deletion is allowed
+	dbClientMock.On("ProvisionWatchersByProfileName", 0, 1, profile).Return([]models.ProvisionWatcher{}, nil)
+	dbClientMock.On("DeleteDeviceProfileByName", profile).Return(nil)
+	return dbClientMock
+}
+
+func newDeviceWriteDIC(dbClientMock *mocks.DBClient) *di.Container {
+	return di.NewContainer(di.ServiceConstructorMap{
+		bootstrapContainer.LoggingClientInterfaceName: func(get di.Get) interface{} {
+			return logger.NewMockClient()
+		},
+		container.ConfigurationName: func(get di.Get) interface{} {
+			return &config.ConfigurationStruct{}
+		},
+		container.DBClientInterfaceName: func(get di.Get) interface{} {
+			return dbClientMock
+		},
+		container.ProfileAssignmentLockName: func(get di.Get) interface{} {
+			return utils.NewProfileAssignmentLock()
+		},
+	})
+}
+
+// assertProfileDeletionBlocked asserts that the device profile deletion waits for the device write
+// in progress, otherwise the deletion cannot see the device which is not in the database yet.
+// The device write blocks in the DBClient mock until the returned channel is closed.
+func assertProfileDeletionBlocked(t *testing.T, dic *di.Container, writing <-chan struct{}, finishWrite func(), deviceWrite func()) {
+	written := make(chan struct{})
+	go func() {
+		defer close(written)
+		deviceWrite()
+	}()
+	<-writing
+
+	deleted := make(chan errors.EdgeX, 1)
+	go func() {
+		ctx, _ := correlation.FromContextOrNew(context.Background())
+		deleted <- DeleteDeviceProfileByName(profile, ctx, dic)
+	}()
+
+	select {
+	case <-deleted:
+		t.Fatal("the device profile deletion should be blocked by the in-flight device write")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	finishWrite()
+	<-written
+
+	select {
+	case err := <-deleted:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("the device profile deletion was not resumed after the device write finished")
+	}
+}
+
+func TestAddDeviceBlocksProfileDeletion(t *testing.T) {
+	deviceName := "testDevice"
+	device := models.Device{Name: deviceName, ServiceName: testDeviceServiceName, ProfileName: profile}
+
+	writing, release := make(chan struct{}), make(chan struct{})
+	dbClientMock := newDeviceWriteDBClientMock(deviceName)
+	dbClientMock.On("DevicesByProfileName", 0, 1, profile).Return([]models.Device{}, nil)
+	dbClientMock.On("AddDevice", mock.Anything).Return(models.Device{Name: deviceName}, nil).Once().
+		Run(func(mock.Arguments) {
+			close(writing)
+			<-release
+		})
+	dic := newDeviceWriteDIC(dbClientMock)
+
+	assertProfileDeletionBlocked(t, dic, writing, func() { close(release) }, func() {
+		ctx, _ := correlation.FromContextOrNew(context.Background())
+		_, err := AddDevice(device, ctx, dic, true, false)
+		require.NoError(t, err)
+	})
+}
+
+func TestPatchDeviceBlocksProfileDeletion(t *testing.T) {
+	deviceName := "testDevice"
+	dto := dtos.UpdateDevice{Name: &deviceName}
+
+	writing, release := make(chan struct{}), make(chan struct{})
+	dbClientMock := newDeviceWriteDBClientMock(deviceName)
+	dbClientMock.On("DevicesByProfileName", 0, 1, profile).Return([]models.Device{}, nil)
+	dbClientMock.On("UpdateDevice", mock.Anything).Return(nil).Once().
+		Run(func(mock.Arguments) {
+			close(writing)
+			<-release
+		})
+	dic := newDeviceWriteDIC(dbClientMock)
+
+	assertProfileDeletionBlocked(t, dic, writing, func() { close(release) }, func() {
+		ctx, _ := correlation.FromContextOrNew(context.Background())
+		require.NoError(t, PatchDevice(dto, ctx, dic, true))
+	})
+}
+
+// The device profile deletion waits for every concurrent device write, releasing only some of them
+// must not let the deletion through.
+func TestConcurrentAddDeviceBlocksProfileDeletion(t *testing.T) {
+	const deviceCount = 3
+	dbClientMock := newDeviceWriteDBClientMock("testDevice")
+	dbClientMock.On("DevicesByProfileName", 0, 1, profile).Return([]models.Device{}, nil)
+
+	writing := make(chan struct{}, deviceCount)
+	releases := make([]chan struct{}, deviceCount)
+	for i := range releases {
+		releases[i] = make(chan struct{})
+		deviceName := fmt.Sprintf("testDevice-%d", i)
+		dbClientMock.On("DeviceNameExists", deviceName).Return(false, nil)
+		dbClientMock.On("AddDevice", mock.MatchedBy(func(d models.Device) bool { return d.Name == deviceName })).
+			Return(models.Device{Name: deviceName}, nil).Once().
+			Run(func(mock.Arguments) {
+				writing <- struct{}{}
+				<-releases[i]
+			})
+	}
+	dic := newDeviceWriteDIC(dbClientMock)
+
+	written := make(chan struct{})
+	go func() {
+		defer close(written)
+		var wg sync.WaitGroup
+		for i := range releases {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				ctx, _ := correlation.FromContextOrNew(context.Background())
+				_, err := AddDevice(models.Device{
+					Name: fmt.Sprintf("testDevice-%d", i), ServiceName: testDeviceServiceName, ProfileName: profile,
+				}, ctx, dic, true, false)
+				assert.NoError(t, err)
+			}()
+		}
+		wg.Wait()
+	}()
+	for range releases {
+		<-writing
+	}
+
+	deleted := make(chan errors.EdgeX, 1)
+	go func() {
+		ctx, _ := correlation.FromContextOrNew(context.Background())
+		deleted <- DeleteDeviceProfileByName(profile, ctx, dic)
+	}()
+
+	// Release the writes one by one, the deletion must stay blocked until the last one completes
+	for i, release := range releases {
+		select {
+		case <-deleted:
+			t.Fatalf("the device profile deletion should still be blocked by %d in-flight device writes", deviceCount-i)
+		case <-time.After(50 * time.Millisecond):
+		}
+		close(release)
+	}
+	<-written
+
+	select {
+	case err := <-deleted:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("the device profile deletion was not resumed after all the device writes finished")
+	}
+}
+
+// The device write waits for the device profile deletion in progress, otherwise a device could be
+// written between the association check and the deletion of the profile it references.
+func TestProfileDeletionBlocksAddDevice(t *testing.T) {
+	deviceName := "testDevice"
+	device := models.Device{Name: deviceName, ServiceName: testDeviceServiceName, ProfileName: profile}
+
+	deleting, release := make(chan struct{}), make(chan struct{})
+	dbClientMock := newDeviceWriteDBClientMock(deviceName)
+	// Block the deletion in the middle of its association check, before the profile is removed
+	dbClientMock.On("DevicesByProfileName", 0, 1, profile).Return([]models.Device{}, nil).Once().
+		Run(func(mock.Arguments) {
+			close(deleting)
+			<-release
+		})
+	dbClientMock.On("AddDevice", mock.Anything).Return(models.Device{Name: deviceName}, nil)
+	dic := newDeviceWriteDIC(dbClientMock)
+
+	deleted := make(chan errors.EdgeX, 1)
+	go func() {
+		ctx, _ := correlation.FromContextOrNew(context.Background())
+		deleted <- DeleteDeviceProfileByName(profile, ctx, dic)
+	}()
+	<-deleting
+
+	added := make(chan errors.EdgeX, 1)
+	go func() {
+		ctx, _ := correlation.FromContextOrNew(context.Background())
+		_, err := AddDevice(device, ctx, dic, true, false)
+		added <- err
+	}()
+
+	select {
+	case <-added:
+		t.Fatal("the device write should be blocked by the device profile deletion in progress")
+	case <-time.After(100 * time.Millisecond):
+	}
+	dbClientMock.AssertNotCalled(t, "AddDevice", mock.Anything)
+
+	close(release)
+	require.NoError(t, <-deleted)
+
+	select {
+	case err := <-added:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("the device write was not resumed after the device profile deletion finished")
 	}
 }
 

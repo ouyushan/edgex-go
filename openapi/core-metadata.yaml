@@ -377,6 +377,18 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/UpdateTags'
+    DevicePropertiesRequest:
+      description: "Add/Update/Remove properties of an existing device"
+      type: object
+      allOf:
+        - $ref: '#/components/schemas/BaseRequest'
+      properties:
+        properties:
+          type: object
+          minProperties: 1
+          description: "A map of properties to add or update. A property whose value is null is deleted instead, nested keys included. The map itself must not be empty, so clearing all properties at once is not supported."
+      required:
+        - properties
     MultiDeviceProfileBasicInfosResponse:
       allOf:
         - $ref: '#/components/schemas/BaseWithTotalCountResponse'
@@ -1270,6 +1282,14 @@ components:
         type: boolean
         default: false
       description: "Indicates whether the response returns only the basic info of the requested entity, omitting its device resources and commands."
+    deviceBasicInfoOnlyParam:
+      in: query
+      name: basicInfoOnly
+      required: false
+      schema:
+        type: boolean
+        default: false
+      description: "Indicates whether the response omits the properties of each device. The properties field is left out of the response entirely, which is indistinguishable from a device that has no properties."
   headers:
     correlatedResponseHeader:
       description: "A response header that returns the unique correlation ID used to initiate the request."
@@ -1906,8 +1926,9 @@ paths:
       - $ref: '#/components/parameters/labelsParam'
       - $ref: '#/components/parameters/descendantsParam'
       - $ref: '#/components/parameters/maxLevelsParam'
+      - $ref: '#/components/parameters/deviceBasicInfoOnlyParam'
     get:
-      summary: "Given the entire range of devices sorted by last modified descending, returns a portion of that range according to the offset and limit parameters. Devices may also be filtered by label or parent."
+      summary: "Given the entire range of devices sorted by last modified descending, returns a portion of that range according to the offset and limit parameters. Devices may also be filtered by label or parent. Callers that do not need the device properties can trim them from the response with basicInfoOnly to save bandwidth."
       responses:
         '200':
           description: "OK"
@@ -2140,6 +2161,81 @@ paths:
                   $ref: '#/components/examples/409DeleteExample'
         '500':
           description: "Internal Server Error"
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/correlatedResponseHeader'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                500Example:
+                  $ref: '#/components/examples/500Example'
+  '/device/name/{name}/properties':
+    parameters:
+      - $ref: '#/components/parameters/correlatedRequestHeader'
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+        description: "The unique name of a device"
+    patch:
+      summary: "Allows adding, updating or removing the properties of an existing device. Properties absent from the request are preserved. A property whose value is null is removed, nested keys included. Clearing all properties at once is not supported, as an empty properties map is rejected. Unlike PATCH /device, this does not invoke the device service validation callback."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DevicePropertiesRequest'
+            example:
+              apiVersion: "v3"
+              requestId: "2463bff9-aa53-4bc4-bebf-42fe81146ea8"
+              properties:
+                property1: "value1"
+                property2ToRemove: null
+                nested:
+                  field3: "field3Value"
+                  field4ToRemove: null
+      responses:
+        '200':
+          description: "Update successful"
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/correlatedResponseHeader'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaseResponse'
+              examples:
+                200Example:
+                  $ref: '#/components/examples/200Example'
+        '400':
+          description: "Request is in an invalid state"
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/correlatedResponseHeader'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                400Example:
+                  $ref: '#/components/examples/400Example'
+        '404':
+          description: "The requested device does not exist"
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/correlatedResponseHeader'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                404Example:
+                  $ref: '#/components/examples/404Example'
+        '500':
+          description: An unexpected error occurred on the server
           headers:
             X-Correlation-ID:
               $ref: '#/components/headers/correlatedResponseHeader'

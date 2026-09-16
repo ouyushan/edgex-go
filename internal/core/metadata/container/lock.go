@@ -18,3 +18,11 @@ var CapacityCheckLockName = di.TypeInstanceToName((*utils.CapacityCheckLock)(nil
 func CapacityCheckLockFrom(get di.Get) *utils.CapacityCheckLock {
 	return get(CapacityCheckLockName).(*utils.CapacityCheckLock)
 }
+
+// ProfileAssignmentLockName contains the name of the metadata's utils.ProfileAssignmentLock implementation in the DIC.
+var ProfileAssignmentLockName = di.TypeInstanceToName((*utils.ProfileAssignmentLock)(nil))
+
+// ProfileAssignmentLockFrom helper function queries the DIC and returns metadata's utils.ProfileAssignmentLock implementation.
+func ProfileAssignmentLockFrom(get di.Get) *utils.ProfileAssignmentLock {
+	return get(ProfileAssignmentLockName).(*utils.ProfileAssignmentLock)
+}
